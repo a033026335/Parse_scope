@@ -6,10 +6,10 @@ import json
 from tkinter import Tk, filedialog
 import socket 
 import pandas as pd
-import inquirer
-import ipaddress
-import re
-from urllib.parse import urlparse, quote, urlencode
+# import inquirer
+# import ipaddress
+# import re
+from urllib.parse import urlparse, quote, urlencode, parse_qs
 
 # pip install pyfiglet
 import pyfiglet
@@ -94,11 +94,27 @@ def convert_to_http_requests(collection_data, collection_type='postman'):
                 query = '&'.join([f'{q["key"]}={q["value"]}' for q in url_details.get('query', [])])
                 path_with_query = f'{path_str}?{query}' if query else path_str
                 first_line = f'{method} {path_with_query} HTTP/1.1\n'
-                # Constructing the headers, including Host
+                # Constructing the headers, including Host and potentially authorization.
                 host = url_details['host']
                 host_str = '.'.join(host) if host else ''
                 headers = item['request'].get('header', [])
                 headers.append({'key': 'Host', 'value': host_str})  # Add Host header
+                #Adding scanning for Content-Type header as part of header to make sure it has required Content-Type parameter.
+                content_type_present = any(header.get('key','') == 'Content-Type' for header in headers)
+                if not content_type_present:
+                    headers.append({'key':'Content-Type', 'value': 'application/json'})
+                # Check for auth object and append auth header accordingly and add it into header.
+                auth = item['request'].get('auth')
+                if auth:
+                    if auth['type'] == 'basic':
+                        import base64
+                        user_pass = f"{auth['basic'][0]['value']}:{auth['basic'][1]['value']}"
+                        encoded_credentials = base64.b64encode(user_pass.encode()).decode()
+                        headers.append({'key': 'Authorization', 'value': f'Basic {encoded_credentials}'})
+                    elif auth['type'] == 'bearer':
+                        token = auth['bearer'][0]['value']
+                        headers.append({'key': 'Authorization', 'value': f'Bearer {token}'})
+                    # Add other auth types here as needed
                 headers_line = '\n'.join([f'{header["key"]}: {header["value"]}' for header in headers]) + '\n\n'
                 # Constructing the body from the 'raw' parameter
                 body = item['request'].get('body', {})
@@ -111,28 +127,50 @@ def convert_to_http_requests(collection_data, collection_type='postman'):
                 method = item.get('method')
                 url = item.get('url')
                 parsed_url = urlparse(url)
-                # Constructing the first line with method and path
-                path_with_query = f'{parsed_url.path}?{parsed_url.query}' if parsed_url.query else parsed_url.path
+                # Handle merging existing and new query parameters
+                existing_query = parse_qs(parsed_url.query)
+                params = item.get('parameters', [])
+                param_dict = {param['name']: param['value'] for param in params if 'name' in param and 'value' in param}
+                all_params = {**existing_query, **param_dict}
+                full_query = urlencode(all_params, doseq=True)
+                path_with_query = parsed_url.path
+                if full_query:
+                    path_with_query += f'?{full_query}'
                 first_line = f'{method} {path_with_query} HTTP/1.1\n'
-                # Constructing the headers, including Host
                 headers = item.get('headers', [])
-                headers.append({'name': 'Host', 'value': parsed_url.netloc})  # Add Host header
+                headers.append({'name': 'Host', 'value': parsed_url.netloc})
+                #Adding scanning for Content-Type header as part of header to make sure it has required Content-Type parameter.
+                content_type_present = any(header.get('name','') == 'Content-Type' for header in headers)
+                if not content_type_present:
+                    headers.append({'name':'Content-Type', 'value': 'application/json'})
+                auth = item.get('authentication', {})
+                auth_type = auth.get('type')
+                if auth_type == 'basic':
+                    import base64
+                    user_pass = f"{auth.get('username')}:{auth.get('password')}"
+                    encoded_credentials = base64.b64encode(user_pass.encode()).decode()
+                    headers.append({'name': 'Authorization', 'value': f'Basic {encoded_credentials}'})
+                elif auth_type == 'bearer':
+                    token = auth.get('token')
+                    headers.append({'name': 'Authorization', 'value': f'Bearer {token}'})
                 headers_line = '\n'.join(f'{header["name"]}: {header["value"]}' for header in headers) + '\n\n'
-                # Handling different body types
                 body = item.get('body', {})
                 body_type = body.get('mimeType')
                 body_content = body.get('text', '')
-                if body_type == 'application/x-www-form-urlencoded':
-                    body_line = urlencode(json.loads(body_content)) + '\n\n'
-                elif body_type == 'application/json':
-                    body_line = json.dumps(json.loads(body_content), indent=2) + '\n\n'
-                elif body_type == 'multipart/form-data':
-                    # Handle multipart/form-data as needed
-                    # You might need to construct this part manually based on your specific needs
-                    body_line = body_content + '\n\n'
-                else:
-                    # Fallback for other types or raw body
-                    body_line = body_content + '\n\n'
+                body_line = body_content + '\n\n'  # Default fallback
+                if body_content and body_type == 'application/json':
+                    try:
+                        json_object = json.loads(body_content)
+                        body_line = json.dumps(json_object, indent=2) + '\n\n'
+                    except json.JSONDecodeError:
+                        print("Error decoding JSON: Invalid content")  # Logging the error
+                        body_line = 'Invalid JSON content.\n\n'
+                elif body_type == 'application/x-www-form-urlencoded':
+                    try:
+                        body_line = urlencode(json.loads(body_content)) + '\n\n'
+                    except json.JSONDecodeError:
+                        print("Error decoding form-urlencoded data: Invalid content")
+                        body_line = 'Invalid form data.\n\n'
                 http_requests.append(first_line + headers_line + body_line)
     return http_requests
 
@@ -161,13 +199,13 @@ def process_postman(collection_data, info_name = None):
         if item.get('request'):
             endpoint_name = item['name']
             endpoint_url = item['request']['url']['raw']
-            endpoint_DNS = endpoint_url.split('//')[1].lstrip().split('/')[0]
+            url_validation=endpoint_url.split('//')[1].lstrip().split('/')[0]
+            print(f'if was captured: {endpoint_url}')
 
-            if "proxy" in endpoint_url:
-                endpoint_name = f'External- {endpoint_name}'
-
+            if ("proxy" or "gateway") in endpoint_url:
+                endpoint_name = f'External - {endpoint_name}'
             else:
-                endpoint_name = f'Internal- {endpoint_name}'
+                endpoint_name = f'Internal - {endpoint_name}'
 
             endpoints.append({ 'Id': '', 'Solution': process_postman_info_name, 'Request': process_postman_info_name, 'RequestScopeType': 'Web Application', 'Name': endpoint_name, 'Description': '',
             'CloudProvider': '', 'ResourceParent': '', 'ResourceCollection': '', 'ResourceName': '', 'Region': '', 'Market' :'',
@@ -212,13 +250,12 @@ def process_Insomnia(collection_data):
         if item.get('_type')== 'request':
             endpoint_name = item.get('name')
             endpoint_url = item.get('url')
-            endpoint_DNS = endpoint_url.split('//')[1].lstrip().split('/')[0]
-
-            if "proxy" in endpoint_url:
-                endpoint_name = f'External- {endpoint_name}'
-
+            #url_validation=endpoint_url.split('//')[1].lstrip().split('/')[0]
+            
+            if ("proxy" or "gateway") in endpoint_url:
+                endpoint_name = f'External - {endpoint_name}'
             else:
-                endpoint_name = f'Internal- {endpoint_name}'
+                endpoint_name = f'Internal - {endpoint_name}'
 
             endpoints.append({ 'Id': '', 'Solution': process_Insomnia_info_name, 'Request': process_Insomnia_info_name, 'RequestScopeType': 'Web Application', 'Name': endpoint_name, 'Description': '',
             'CloudProvider': '', 'ResourceParent': '', 'ResourceCollection': '', 'ResourceName': '', 'Region': '', 'Market' :'',
@@ -365,7 +402,7 @@ def choice_one():
                         data = json.load(file)
                         try:
                             process_postman(data)
-                        except AttributeError:
+                        except IndexError or AttributeError:
                             print('Invalid Postman collection. Please ensure all parameters within the collection are complete.')
                         http_requests.extend(convert_to_http_requests(data, 'postman'))
                 prompt_text = "Do you have more Postman collections?"
@@ -386,7 +423,7 @@ def choice_one():
                         data = json.load(file)
                         try:
                             process_Insomnia(data)
-                        except AttributeError:
+                        except IndexError or AttributeError:
                             print('Invalid Insomnia collection. Please ensure all parameters within the collection are complete.')
                         http_requests.extend(convert_to_http_requests(data, 'insomnia'))
                 prompt_text = "Do you have more Insomnia collections?"
@@ -465,7 +502,7 @@ def main():
     while True:
         reset_global_varialbe_ip()
         reset_global_varialbe_API()
-        ascii_banner = pyfiglet.figlet_format("Welcome to Parse Scope!!")
+        ascii_banner = pyfiglet.figlet_format("Howdy from Tech Review!!")
         print(ascii_banner)
         choice = get_user_input()
         if choice == '1':
